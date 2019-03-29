@@ -16,9 +16,9 @@ def astro_api():
     soup = BeautifulSoup(r.text, 'html.parser')
     astro = soup.select("div.TODAY_CONTENT > h3")[0]
     items = soup.select("div.TODAY_CONTENT > p")
-    resp_data = astro.text
+    resp_data = astro.text+"<br>"
     for a in items:
-        resp_data += a.text
+        resp_data += a.text+"<br>"
     return resp_data
 
 if __name__ == "__main__":
