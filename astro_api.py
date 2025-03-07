@@ -5,6 +5,9 @@ import os
 import json
 from datetime import datetime
 import logging
+import time
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.cron import CronTrigger
 
 # Import OpenCC for Chinese conversion
 try:
@@ -22,6 +25,7 @@ logger = logging.getLogger(__name__)
 CACHE_DIR = os.path.dirname(os.path.abspath(__file__))
 CACHE_FILE = os.path.join(CACHE_DIR, "astro_cache.json")
 cache = {}
+scheduler = None
 
 # Initialize Chinese converter
 t2s_converter = None
@@ -67,8 +71,13 @@ def is_cache_valid(num):
             'date' in cache[str(num)] and 
             cache[str(num)]['date'] == today)
 
-def fetch_astro_data(num):
+def fetch_astro_data(num, force_update=False):
     """Fetch astrology data from source website"""
+    # If data is in cache and valid, return it unless force_update is True
+    if not force_update and is_cache_valid(num):
+        logger.debug(f"Using valid cache for astrology {num}")
+        return cache[str(num)]
+        
     try:
         r = requests.get(f'http://astro.click108.com.tw/daily_{num}.php?iAstro={num}')
         r.raise_for_status()
@@ -87,10 +96,89 @@ def fetch_astro_data(num):
             "timestamp": datetime.now().isoformat()
         }
         
+        # Update cache
+        cache[str(num)] = result
         return result
     except Exception as e:
         logger.error(f"Error fetching astrology data: {e}")
         raise
+
+def fetch_all_astro_data():
+    """Fetch data for all 12 astrology signs"""
+    logger.info("Scheduled job: Fetching data for all astrology signs")
+    updated = False
+    
+    for num in range(12):  # 0-11 for the 12 signs
+        try:
+            # Check if current data is different from cached data
+            if needs_update(num):
+                logger.info(f"Updating data for astrology sign {num}")
+                fetch_astro_data(num, force_update=True)
+                updated = True
+            else:
+                logger.info(f"No updates needed for astrology sign {num}")
+        except Exception as e:
+            logger.error(f"Error updating astrology sign {num}: {e}")
+    
+    # Save cache if any updates were made
+    if updated:
+        logger.info("Updates found, saving cache")
+        save_cache()
+    else:
+        logger.info("No updates found for any astrology sign")
+
+def needs_update(num):
+    """Check if the astrology data needs to be updated"""
+    try:
+        # If not in cache or not valid for today, definitely needs update
+        if str(num) not in cache or not is_cache_valid(num):
+            return True
+            
+        # Fetch current data without saving to cache
+        r = requests.get(f'http://astro.click108.com.tw/daily_{num}.php?iAstro={num}')
+        r.raise_for_status()
+        
+        # Parse HTML
+        soup = BeautifulSoup(r.text, 'html.parser')
+        items = soup.select("div.TODAY_CONTENT > p")
+        current_items = [item.text for item in items]
+        
+        # Compare with cached items
+        if str(num) in cache and 'items' in cache[str(num)]:
+            cached_items = cache[str(num)]['items']
+            # Check if content has changed
+            if cached_items != current_items:
+                logger.info(f"Content changed for astrology {num}")
+                return True
+                
+        return False
+    except Exception as e:
+        logger.error(f"Error checking for updates for astrology {num}: {e}")
+        # In case of error, assume update is needed
+        return True
+
+def setup_scheduler():
+    """Set up the scheduler for periodic data fetching"""
+    global scheduler
+    if scheduler:
+        scheduler.shutdown()
+    
+    scheduler = BackgroundScheduler()
+    # Schedule jobs at 8:00 AM and 8:00 PM every day
+    scheduler.add_job(
+        fetch_all_astro_data, 
+        CronTrigger(hour='8,20'), 
+        id='fetch_astro_morning_evening'
+    )
+    
+    # Add a job that runs immediately when the app starts
+    scheduler.add_job(
+        fetch_all_astro_data, 
+        id='fetch_astro_startup'
+    )
+    
+    scheduler.start()
+    logger.info("Scheduler started with jobs at 8:00 AM and 8:00 PM")
 
 # Create Flask app
 app = Flask(__name__)
@@ -118,8 +206,7 @@ def astro_api():
         logger.info(f"Fetching fresh data for astrology {num}")
         try:
             data = fetch_astro_data(num)
-            # Update cache
-            cache[str(num)] = data
+            # Cache is updated within fetch_astro_data
             save_cache()
             resp_data = data["html"]
         except Exception:
@@ -160,8 +247,7 @@ def astro_json_api(num):
             logger.info(f"Fetching fresh data for astrology {num}")
             try:
                 data = fetch_astro_data(num)
-                # Update cache
-                cache[str(num)] = data
+                # Cache is updated within fetch_astro_data
                 save_cache()
             except Exception as e:
                 # 如果获取失败且缓存中存在该星座数据，则使用缓存数据
@@ -194,6 +280,17 @@ def astro_json_api(num):
         logger.error(f"Error in API: {e}")
         return jsonify({"error": "Internal server error"}), 500
 
+# Add route to manually trigger update
+@api_bp.route("/update", methods=['GET'])
+def manual_update():
+    """Endpoint to manually trigger astrology data update"""
+    try:
+        fetch_all_astro_data()
+        return jsonify({"status": "success", "message": "Data update triggered successfully"})
+    except Exception as e:
+        logger.error(f"Error triggering data update: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
 # Register blueprint
 app.register_blueprint(api_bp)
 
@@ -201,11 +298,31 @@ def create_app():
     """Application factory function for WSGI servers"""
     # Load cache when app starts
     load_cache()
+    
+    # Fetch all astrology data immediately
+    logger.info("Application startup: Fetching all astrology data")
+    try:
+        fetch_all_astro_data()  # Synchronously fetch data at startup
+    except Exception as e:
+        logger.error(f"Error fetching astrology data at startup: {e}")
+    
+    # Set up the scheduler for future updates
+    setup_scheduler()
     return app
 
 if __name__ == "__main__":
     # Load cache at startup
     load_cache()
+    
+    # Fetch all astrology data immediately
+    logger.info("Application startup: Fetching all astrology data")
+    try:
+        fetch_all_astro_data()  # Synchronously fetch data at startup
+    except Exception as e:
+        logger.error(f"Error fetching astrology data at startup: {e}")
+    
+    # Set up scheduler
+    setup_scheduler()
     
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port)
